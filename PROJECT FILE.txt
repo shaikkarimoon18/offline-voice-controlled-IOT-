@@ -1,0 +1,275 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import librosa
+import sounddevice as sd
+import RPi.GPIO as GPIO
+import time
+
+# GPIO pin setup
+LIGHT_PIN = 17
+FAN_PIN = 27
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(LIGHT_PIN, GPIO.OUT)
+GPIO.setup(FAN_PIN, GPIO.OUT)
+
+GPIO.output(LIGHT_PIN, GPIO.HIGH)
+GPIO.output(FAN_PIN, GPIO.HIGH)
+
+# CONFIG (must match training)
+
+SAMPLE_RATE = 16000
+N_MFCC = 20
+MAX_LEN = 130  # set same value as training max_len
+
+labels = ["fan", "light"]
+
+# LSTM MODEL (same as training)
+class VoiceLSTM(nn.Module):
+    def __init__(self, input_size=20, hidden_size=64, num_classes=4):
+        super(VoiceLSTM, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, num_classes)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = out[:, -1, :]
+        out = self.fc(out)
+        return out
+
+
+# LOAD MODEL
+model = VoiceLSTM()
+model.load_state_dict(torch.load("voice_model.pth",
+                                 map_location=torch.device('cpu')))
+model.eval()
+
+print("Model Loaded")
+
+sts = 0
+sts1 = 0
+
+
+# RECORD AUDIO
+def record_audio(duration=2):
+    print("Speak now...")
+    audio = sd.rec(int(duration * SAMPLE_RATE),
+                   samplerate=SAMPLE_RATE,
+                   channels=1)
+    sd.wait()
+    return audio.flatten()
+
+
+# FEATURE EXTRACTION
+def extract_features(audio):
+    mfcc = librosa.feature.mfcc(y=audio, sr=SAMPLE_RATE, n_mfcc=N_MFCC)
+    return mfcc.T
+
+
+# PAD SEQUENCE
+def pad_sequence(mfcc):
+    if mfcc.shape[0] < MAX_LEN:
+        return np.pad(mfcc, ((0, MAX_LEN - mfcc.shape[0]), (0, 0)))
+    return mfcc[:MAX_LEN]
+
+
+# PREDICT FUNCTION
+def predict_command():
+    audio = record_audio()
+
+    mfcc = extract_features(audio)
+    mfcc = pad_sequence(mfcc)
+
+    mfcc_tensor = torch.tensor(mfcc, dtype=torch.float32).unsqueeze(0)
+
+    with torch.no_grad():
+        output = model(mfcc_tensor)
+        pred = torch.argmax(output).item()
+
+    return labels[pred]
+
+
+# CONTROL FUNCTION
+def control_device(command):
+
+    global sts, sts1
+
+    print("Detected Command:", command)
+
+    if command == "light":
+        GPIO.output(LIGHT_PIN, sts1)
+        print('light ON/OFF')
+        sts1 = 1 - sts1
+
+    elif command == "fan":
+        print('Fan ON/OFF')
+        GPIO.output(FAN_PIN, sts)
+        sts = 1 - sts
+
+    else:
+        print("Unknown command")
+
+
+# MAIN LOOP
+sts = 0
+sts1 = 0
+
+while True:
+
+    input("\nPress Enter to give command...")
+    cmd = predict_command()
+    control_device(cmd)
+import os
+import numpy as np
+import librosa
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+
+# -------------------------
+# CONFIG
+# -------------------------
+
+DATASET_PATH = "dataset"
+SAMPLE_RATE = 16000
+N_MFCC = 20
+
+EPOCHS = 50
+
+label_map = {
+    "light": 0,
+    "motor": 1,
+    "door": 2,
+    "fan": 3
+}
+
+
+# -------------------------
+# FEATURE EXTRACTION
+# -------------------------
+
+def extract_features(file_path):
+    audio, sr = librosa.load(file_path, sr=SAMPLE_RATE)
+
+    mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=N_MFCC)
+
+    return mfcc.T  # (time_steps, features)
+
+
+X = []
+y = []
+
+print("Loading dataset...")
+
+for label in label_map:
+
+    folder = os.path.join(DATASET_PATH, label)
+
+    if not os.path.exists(folder):
+        print(f"Warning: {folder} not found")
+        continue
+
+    for file in os.listdir(folder):
+        if file.endswith(".wav"):
+            path = os.path.join(folder, file)
+            features = extract_features(path)
+
+            X.append(features)
+            y.append(label_map[label])
+
+
+# -------------------------
+# PADDING SEQUENCES
+# -------------------------
+
+print("Padding sequences...")
+
+max_len = max([x.shape[0] for x in X])
+
+
+def pad_sequence(x, max_len):
+
+    if x.shape[0] < max_len:
+        pad_width = max_len - x.shape[0]
+        return np.pad(x, ((0, pad_width), (0, 0)))
+
+    return x[:max_len]
+
+
+X = np.array([pad_sequence(x, max_len) for x in X])
+y = np.array(y)
+
+print("Dataset shape:", X.shape)
+
+
+# -------------------------
+# CONVERT TO TENSORS
+# -------------------------
+
+X_tensor = torch.tensor(X, dtype=torch.float32)
+
+y_tensor = torch.tensor(y, dtype=torch.long)
+
+
+# -------------------------
+# LSTM MODEL
+# -------------------------
+
+class VoiceLSTM(nn.Module):
+
+    def __init__(self, input_size=20, hidden_size=64, num_classes=4):
+
+        super(VoiceLSTM, self).__init__()
+
+        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
+
+        self.fc = nn.Linear(hidden_size, num_classes)
+
+    def forward(self, x):
+
+        out, _ = self.lstm(x)
+
+        out = out[:, -1, :]  # last timestep
+
+        out = self.fc(out)
+
+        return out
+
+
+model = VoiceLSTM()
+
+
+# -------------------------
+# TRAINING
+# -------------------------
+
+criterion = nn.CrossEntropyLoss()
+
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+print("Training started...")
+
+for epoch in range(EPOCHS):
+
+    outputs = model(X_tensor)
+
+    loss = criterion(outputs, y_tensor)
+
+    optimizer.zero_grad()
+
+    loss.backward()
+
+    optimizer.step()
+
+    print(f"Epoch [{epoch+1}/{EPOCHS}], Loss: {loss.item():.4f}")
+
+
+# -------------------------
+# SAVE MODEL
+# -------------------------
+
+torch.save(model.state_dict(), "voice_model.pth")
+
+print("Training complete. Model saved as voice_model.pth")
